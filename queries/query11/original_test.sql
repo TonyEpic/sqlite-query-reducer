@@ -1,0 +1,5 @@
+CREATE TABLE V (l BOOLEAN UNIQUE UNIQUE, q BOOLEAN);
+INSERT INTO V VALUES ((103 = (-86)), (NOT true));
+INSERT INTO V SELECT * FROM (VALUES ((NOT NULL), false), (NULL, NULL)) AS A WHERE ((false <> true) <> (NOT true));
+SELECT * FROM V AS K WHERE (NOT (((+146) + 52) < ((58 - 255) - ((18 * 82) / (+47)))));
+
