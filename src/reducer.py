@@ -23,17 +23,21 @@ from pathlib import Path
 
 from .driver import Driver
 from .oracle import OraclePool
+from .passes.ast_aware_reducer import AstAwareReducerPass
 from .passes.base import Pass
+from .passes.coarse_reducer import CoarseReducerPass
 from .passes.token_ddmin import TokenDdminPass
 
 
 def build_passes() -> list[Pass]:
     """Return the ordered list of reduction passes.
 
-    Order: coarse structural passes first (Pirmin's AST-aware passes will be
-    inserted here), token ddmin last as the always-available finisher.
+    Order:
+      1. Coarse:  statement-level ddmin (remove whole statements).
+      2. AST-aware:  grammar-aware simplifications within each statement.
+      3. Token ddmin:  always-available finisher.
     """
-    return [TokenDdminPass()]
+    return [CoarseReducerPass(), AstAwareReducerPass(), TokenDdminPass()]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

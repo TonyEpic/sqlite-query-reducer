@@ -26,3 +26,7 @@ out/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# PDF
+FAQ_guide_(part 2).pdf
+Project_description_reducer.pdf
