@@ -29,15 +29,19 @@ from .passes.coarse_reducer import CoarseReducerPass
 from .passes.token_ddmin import TokenDdminPass
 
 
+from .passes.string_simplify import StringSimplifyPass
+
+
 def build_passes() -> list[Pass]:
     """Return the ordered list of reduction passes.
 
     Order:
       1. Coarse:  statement-level ddmin (remove whole statements).
       2. AST-aware:  grammar-aware simplifications within each statement.
-      3. Token ddmin:  always-available finisher.
+      3. String-simplify:  regex-based simplifications (no parser needed).
+      4. Token ddmin:  always-available finisher.
     """
-    return [CoarseReducerPass(), AstAwareReducerPass(), TokenDdminPass()]
+    return [CoarseReducerPass(), AstAwareReducerPass(), StringSimplifyPass(), TokenDdminPass()]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

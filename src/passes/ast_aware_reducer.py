@@ -24,21 +24,54 @@ ProgressHook = Callable[[str], None]
 
 
 def _try_parse(query: str) -> list[exp.Expression] | None:
-    """Parse SQL with sqlglot.  Returns ``None`` on failure.
+    """Parse SQL with sqlglot.  Returns ``None`` on total failure.
+
+    First attempts to parse the entire query at once.  If that fails, falls
+    back to splitting on ``;`` and parsing each part individually.  Parts
+    that still cannot be parsed are replaced with ``None`` in the list so
+    callers can preserve the original text for those.
 
     Filters out ``None`` entries that sqlglot produces for empty statements
     (e.g. stray ``;`` delimiters).
     """
     try:
         parsed = sqlglot.parse(query)
-        return [s for s in parsed if s is not None]
+        result = [s for s in parsed if s is not None]
+        if result:
+            return result
     except Exception:
-        return None
+        pass
+
+    # Fallback: split on ; and parse individual statements
+    parts = query.split(";")
+    result: list[exp.Expression | None] = []
+    any_ok = False
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = sqlglot.parse(stripped)
+            for s in parsed:
+                if s is not None:
+                    result.append(s)
+                    any_ok = True
+        except Exception:
+            result.append(None)  # Placeholder for unparseable
+    return result if any_ok else None
 
 
-def _rebuild(statements: list[exp.Expression]) -> str:
-    """Rebuild a multi-statement query from a list of parsed expressions."""
-    return ";\n".join(stmt.sql() for stmt in statements)
+def _rebuild(statements: list[exp.Expression | str]) -> str:
+    """Rebuild a multi-statement query from a list of parsed expressions or str fallbacks."""
+    parts = []
+    for s in statements:
+        if s is None:
+            continue
+        if isinstance(s, str):
+            parts.append(s)
+        else:
+            parts.append(s.sql())
+    return ";\n".join(parts)
 
 
 class AstAwareReducerPass:
@@ -85,7 +118,12 @@ class AstAwareReducerPass:
         if not parsed:
             return
 
+        # Keep original text parts as fallback for unparseable statements
+        orig_parts = query.split(";")
+
         for i, stmt in enumerate(parsed):
+            if stmt is None:
+                continue  # Skip unparseable statements
             original_sql = stmt.sql()
             for cand_stmt in self._simplify_statement(stmt):
                 try:
@@ -94,9 +132,17 @@ class AstAwareReducerPass:
                     continue
                 if cand_sql == original_sql:
                     continue
-                rebuilt = list(parsed)
+                rebuilt = list(parsed)  # May contain None placeholders
                 rebuilt[i] = cand_stmt
-                yield _rebuild(rebuilt)
+                # Replace None entries with original text for rebuilding
+                rebuild_parts: list[exp.Expression | str] = []
+                for j, p in enumerate(rebuilt):
+                    if p is None:
+                        if j < len(orig_parts):
+                            rebuild_parts.append(orig_parts[j].strip())
+                    else:
+                        rebuild_parts.append(p)
+                yield _rebuild(rebuild_parts)
 
     def _simplify_statement(self, stmt: exp.Expression):
         """Dispatch to the appropriate simplifier for *stmt*."""
@@ -116,11 +162,27 @@ class AstAwareReducerPass:
         """Yield SELECT variants with optional clauses / items removed."""
 
         # -- optional clauses (safe to drop) ------------------------------
-        for arg_name in ("where", "order", "limit", "group", "having"):
+        for arg_name in ("where", "order", "limit", "group", "having", "offset"):
             if stmt.args.get(arg_name):
                 new = stmt.copy()
                 new.set(arg_name, None)
                 yield new
+
+        # -- CTEs (WITH clauses) — try removing one at a time -------------
+        ctes = stmt.args.get("with_") or stmt.args.get("with")
+        if ctes:
+            cte_exprs = ctes.args.get("expressions", [])
+            for idx in range(len(cte_exprs)):
+                new = stmt.copy()
+                with_key = "with_" if "with_" in new.args else "with"
+                new_cte_list = list(new.args[with_key].args.get("expressions", []))
+                if idx < len(new_cte_list):
+                    del new_cte_list[idx]
+                    if new_cte_list:
+                        new.args[with_key].set("expressions", new_cte_list)
+                    else:
+                        new.set(with_key, None)
+                    yield new
 
         # -- DISTINCT -----------------------------------------------------
         if stmt.args.get("distinct"):
@@ -149,6 +211,148 @@ class AstAwareReducerPass:
                     del new_exprs[idx]
                     new.set("expressions", new_exprs)
                     yield new
+
+        # -- Expression-level simplifications (tautologies, CASE collapse) -
+        yield from self._simplify_expressions(stmt)
+
+    def _simplify_expressions(self, stmt: exp.Expression):
+        """Walk the AST and try expression-level simplifications:
+
+        - Tautologies: ``x = x`` → TRUE, ``x <> x`` → FALSE, etc.
+        - CASE collapse: all branches → same result → replace with result.
+        - EXISTS with WHERE false → FALSE.
+        - Short-circuit OR/AND.
+        """
+        # Tautology / contradiction simplification
+        for bin_op in list(stmt.find_all(exp.Binary)):
+            try:
+                left_sql = bin_op.left.sql()
+                right_sql = bin_op.right.sql()
+            except Exception:
+                continue
+            if left_sql == right_sql:
+                op = type(bin_op)
+                if op in (exp.EQ, exp.GTE, exp.LTE, exp.Is):
+                    replacement = exp.Boolean(this=True)
+                elif op in (exp.NEQ, exp.LT, exp.GT):
+                    replacement = exp.Boolean(this=False)
+                else:
+                    continue
+                # Do an in-place swap, copy, then restore
+                parent = bin_op.parent
+                if parent is not None and self._swap_in_parent(parent, bin_op, replacement):
+                    try:
+                        new = stmt.copy()
+                        yield new
+                    finally:
+                        self._swap_in_parent(parent, replacement, bin_op)
+                    break  # only yield one from this node type
+
+        # CASE branch collapse: all branches produce the same result
+        for case_expr in list(stmt.find_all(exp.Case)):
+            try:
+                ifs = case_expr.args.get("ifs") or []
+                default = case_expr.args.get("default")
+                if not ifs:
+                    continue
+                all_same, result_node = self._case_all_same(ifs, default)
+                if all_same and result_node is not None:
+                    parent = case_expr.parent
+                    if parent is not None and self._swap_in_parent(parent, case_expr, result_node.copy()):
+                        try:
+                            new = stmt.copy()
+                            yield new
+                        finally:
+                            self._swap_in_parent(parent, result_node.copy(), case_expr)
+                        break
+            except Exception:
+                continue
+
+        # EXISTS with WHERE false → FALSE
+        for exists_expr in list(stmt.find_all(exp.Exists)):
+            try:
+                inner = exists_expr.this
+                if isinstance(inner, exp.Select):
+                    where_clause = inner.args.get("where")
+                    if where_clause is not None:
+                        # The Boolean node is nested inside the WHERE wrapper
+                        cond = where_clause.this if hasattr(where_clause, 'this') else where_clause
+                        if isinstance(cond, exp.Boolean) and cond.this is False:
+                            parent = exists_expr.parent
+                            if parent is not None and self._swap_in_parent(parent, exists_expr, exp.Boolean(this=False)):
+                                try:
+                                    new = stmt.copy()
+                                    yield new
+                                finally:
+                                    self._swap_in_parent(parent, exp.Boolean(this=False), exists_expr)
+                                break
+            except Exception:
+                continue
+
+        # Simplify redundant OR: x OR true → true
+        for combo_op in list(stmt.find_all(exp.Or)):
+            if self._is_boolean_literal(combo_op.left, True) or self._is_boolean_literal(combo_op.right, True):
+                parent = combo_op.parent
+                if parent is not None and self._swap_in_parent(parent, combo_op, exp.Boolean(this=True)):
+                    try:
+                        new = stmt.copy()
+                        yield new
+                    finally:
+                        self._swap_in_parent(parent, exp.Boolean(this=True), combo_op)
+                    break
+
+        # Simplify redundant AND: x AND false → false
+        for combo_op in list(stmt.find_all(exp.And)):
+            if self._is_boolean_literal(combo_op.left, False) or self._is_boolean_literal(combo_op.right, False):
+                parent = combo_op.parent
+                if parent is not None and self._swap_in_parent(parent, combo_op, exp.Boolean(this=False)):
+                    try:
+                        new = stmt.copy()
+                        yield new
+                    finally:
+                        self._swap_in_parent(parent, exp.Boolean(this=False), combo_op)
+                    break
+
+    @staticmethod
+    def _is_boolean_literal(node: exp.Expression, value: bool) -> bool:
+        """Check if node is a Boolean literal with given value."""
+        return isinstance(node, exp.Boolean) and node.this is value
+
+    @staticmethod
+    def _case_all_same(ifs: list, default) -> tuple[bool, exp.Expression | None]:
+        """Return (True, result_node) if all CASE branches produce the same result."""
+        result_sql = None
+        result_node = None
+        for if_clause in ifs:
+            true_branch = if_clause.args.get("true")
+            if true_branch:
+                r = true_branch.sql()
+                if result_sql is None:
+                    result_sql = r
+                    result_node = true_branch
+                elif r != result_sql:
+                    return False, None
+        if default:
+            if result_sql is None:
+                result_sql = default.sql()
+                result_node = default
+            elif default.sql() != result_sql:
+                return False, None
+        return result_sql is not None, result_node
+
+    @staticmethod
+    def _swap_in_parent(parent: exp.Expression, old: exp.Expression, new: exp.Expression) -> bool:
+        """Swap old child with new child in parent. Returns True on success."""
+        for key, val in list(parent.args.items()):
+            if val is old:
+                parent.set(key, new)
+                return True
+            elif isinstance(val, list):
+                for i, item in enumerate(val):
+                    if item is old:
+                        val[i] = new
+                        return True
+        return False
 
     # ── CREATE simplifications ──────────────────────────────────────────
 
@@ -313,3 +517,26 @@ class AstAwareReducerPass:
                 parent.set(key, [
                     replacement if x is child else x for x in val
                 ])
+
+    @staticmethod
+    def _replace_node_in_copy(
+        tree: exp.Expression,
+        target: exp.Expression,
+        replacement: exp.Expression,
+    ) -> None:
+        """Replace *target* with *replacement* in *tree* (mutates tree)."""
+        if tree is target:
+            return
+        for key, val in list(tree.args.items()):
+            if val is target:
+                tree.set(key, replacement)
+            elif isinstance(val, list):
+                new_list = []
+                for item in val:
+                    if item is target:
+                        new_list.append(replacement)
+                    else:
+                        new_list.append(item)
+                tree.set(key, new_list)
+            elif isinstance(val, exp.Expression):
+                AstAwareReducerPass._replace_node_in_copy(val, target, replacement)
