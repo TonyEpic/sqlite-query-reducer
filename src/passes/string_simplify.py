@@ -114,9 +114,9 @@ class StringSimplifyPass:
             self._simplify_case_collapse,
             self._simplify_exists,
             self._simplify_joins,
-            self._simplify_tautologies,
+            self._simplify_drop_where,
+            self._simplify_drop_columns,
             self._simplify_collate,
-            self._simplify_boolean_shortcut,
             self._simplify_coalesce_identity,
             self._simplify_order_limit_offset,
         ]
@@ -309,6 +309,24 @@ class StringSimplifyPass:
             if len(candidate) < len(query):
                 yield candidate
 
+    # ── WHERE clause dropping ───────────────────────────────────────────
+
+    _WHERE_RE = re.compile(
+        r'\bWHERE\s+(.+?)(?=\s+(?:ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET)\b|\s*\)|\s*;|\s*$)',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _simplify_drop_where(self, query: str):
+        """Try removing each WHERE clause, replacing it with nothing.
+
+        Matches ``WHERE condition`` stopping before ORDER BY, GROUP BY,
+        HAVING, LIMIT, OFFSET, a closing paren, a semicolon, or end of string.
+        """
+        for m in self._WHERE_RE.finditer(query):
+            candidate = query[:m.start()] + query[m.end():]
+            if len(candidate) < len(query):
+                yield candidate
+
     # ── Boolean short-circuit ───────────────────────────────────────────
 
     _OR_TRUE_RE = re.compile(r'\bTRUE\s+OR\b', re.IGNORECASE)
@@ -340,18 +358,302 @@ class StringSimplifyPass:
             if len(candidate) < len(query):
                 yield candidate
 
-    # ── ORDER BY / LIMIT / OFFSET stripping ─────────────────────────────
+    # ── ORDER BY / GROUP BY / LIMIT / OFFSET stripping ──────────────────
 
     def _simplify_order_limit_offset(self, query: str):
-        """Strip ORDER BY, LIMIT, OFFSET, ASC, DESC."""
-        for pattern, _ in [
-            (re.compile(r'\s+OFFSET\s+\d+', re.I), None),
-            (re.compile(r'\s+LIMIT\s+\d+', re.I), None),
-            (re.compile(r'\s+ASC\b', re.I), None),
-            (re.compile(r'\s+DESC\b', re.I), None),
+        """Strip ORDER BY, GROUP BY, LIMIT, OFFSET, ASC, DESC."""
+        # ORDER BY <expr_list> — stop before LIMIT/OFFSET/;/) or end of string
+        for m in re.finditer(
+            r'\s+ORDER\s+BY\s+.+?(?=\s+LIMIT\s|\s+OFFSET\s|\s*;|\)|\s*$)',
+            query, re.IGNORECASE | re.DOTALL,
+        ):
+            candidate = query[:m.start()] + query[m.end():]
+            if len(candidate) < len(query):
+                yield candidate
+
+        # GROUP BY <expr_list> — stop before ORDER/LIMIT/OFFSET/HAVING/;/) or end
+        for m in re.finditer(
+            r'\s+GROUP\s+BY\s+.+?(?=\s+ORDER\s|\s+LIMIT\s|\s+OFFSET\s|\s+HAVING\s|\s*;|\)|\s*$)',
+            query, re.IGNORECASE | re.DOTALL,
+        ):
+            candidate = query[:m.start()] + query[m.end():]
+            if len(candidate) < len(query):
+                yield candidate
+
+        # ASC / DESC keywords
+        for pattern in [
+            re.compile(r'\s+ASC\b', re.I),
+            re.compile(r'\s+DESC\b', re.I),
+        ]:
+            for m in pattern.finditer(query):
+                candidate = query[:m.start()] + query[m.end():]
+                if len(candidate) < len(query):
+                    yield candidate
+
+        # LIMIT / OFFSET
+        for pattern in [
+            re.compile(r'\s+LIMIT\s+\d+', re.I),
+            re.compile(r'\s+OFFSET\s+\d+', re.I),
         ]:
             for m in pattern.finditer(query):
                 yield query[:m.start()] + query[m.end():]
+
+    # ── Drop unreferenced columns from CREATE TABLE + INSERT ────────────
+
+    # Matches CREATE TABLE name (col type, col type, ...)
+    _CREATE_TABLE_RE = re.compile(
+        r'\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*?)\)\s*;',
+        re.IGNORECASE | re.DOTALL,
+    )
+    # Matches INSERT INTO name VALUES(...)
+    _INSERT_VALUES_RE = re.compile(
+        r'\bINSERT\s+INTO\s+(\w+)\s*VALUES\s*\((.+?)\)\s*;',
+        re.IGNORECASE | re.DOTALL,
+    )
+    # Matches table.column or alias.column references (excludes numeric prefixes)
+    _COLUMN_REF_RE = re.compile(r'\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b')
+
+    # SQL keywords that should never be treated as table aliases
+    _SQL_KEYWORDS = frozenset({
+        'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL',
+        'TRUE', 'FALSE', 'AS', 'ON', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'CROSS',
+        'FULL', 'OUTER', 'NATURAL', 'USING', 'GROUP', 'BY', 'ORDER', 'ASC',
+        'DESC', 'LIMIT', 'OFFSET', 'HAVING', 'UNION', 'ALL', 'DISTINCT',
+        'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'EXISTS', 'BETWEEN', 'LIKE',
+        'INTO', 'VALUES', 'SET', 'CREATE', 'TABLE', 'INSERT', 'UPDATE',
+        'DELETE', 'DROP', 'ALTER', 'INDEX', 'VIEW', 'WITH', 'RECURSIVE',
+        'OVER', 'PARTITION', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'COALESCE',
+        'CAST', 'DENSE_RANK', 'RANK', 'ROW_NUMBER', 'LAG', 'LEAD',
+        'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'DEFAULT', 'CHECK',
+        'UNIQUE', 'CONSTRAINT', 'CASCADE', 'IF', 'EXISTS', 'NOT', 'NULL',
+        'INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT',
+        'INT2', 'INT8', 'REAL', 'FLOAT', 'DOUBLE', 'PRECISION', 'NUMERIC',
+        'DECIMAL', 'BOOLEAN', 'DATE', 'DATETIME', 'TIMESTAMP', 'TEXT',
+        'VARCHAR', 'CHAR', 'CHARACTER', 'VARYING', 'NCHAR', 'NVARCHAR',
+        'CLOB', 'BLOB', 'NONE', 'UNSIGNED', 'SIGNED', 'NATIVE',
+    })
+
+    @classmethod
+    def _is_keyword(cls, word: str) -> bool:
+        return word.upper() in cls._SQL_KEYWORDS
+
+    def _simplify_drop_columns(self, query: str):
+        """Try dropping individual columns from CREATE TABLE + INSERT statements.
+
+        For each table with > 1 column, try removing each column one at a time
+        from both the CREATE TABLE definition and all associated INSERT statements.
+        The oracle validates every candidate, so we don't need to guess which
+        columns are actually referenced — we just try them all.
+        """
+        # Parse CREATE TABLEs
+        table_columns: dict[str, list[str]] = {}
+        table_ct_spans: dict[str, tuple[int, int]] = {}
+
+        for ct_match in self._CREATE_TABLE_RE.finditer(query):
+            tbl_name = ct_match.group(1).lower()
+            cols_text = ct_match.group(2)
+            columns = self._parse_create_columns(cols_text)
+            if columns and len(columns) > 1:
+                table_columns[tbl_name] = columns
+                table_ct_spans[tbl_name] = (ct_match.start(), ct_match.end())
+
+        if not table_columns:
+            return
+
+        # Parse INSERTs
+        table_inserts: dict[str, list[tuple[int, int]]] = {}
+        for ins_match in self._INSERT_VALUES_RE.finditer(query):
+            tbl_name = ins_match.group(1).lower()
+            if tbl_name in table_columns:
+                table_inserts.setdefault(tbl_name, []).append(
+                    (ins_match.start(), ins_match.end())
+                )
+
+        # For each table, try dropping each column one at a time
+        for tbl_name, columns in list(table_columns.items()):
+            inserts = table_inserts.get(tbl_name, [])
+
+            for drop_idx in range(len(columns)):
+                keep_indices = set(range(len(columns)))
+                keep_indices.discard(drop_idx)
+
+                # Rebuild CREATE TABLE without this column
+                ct_start, ct_end = table_ct_spans[tbl_name]
+                ct_text = query[ct_start:ct_end]
+                ct_match = self._CREATE_TABLE_RE.search(ct_text)
+                if ct_match is None:
+                    continue
+                new_cols = [columns[i] for i in sorted(keep_indices)]
+                new_ct = self._rebuild_create_table(ct_text, ct_match, columns, new_cols)
+                if new_ct is None:
+                    continue
+
+                # Build candidate
+                full_candidate = query
+                full_candidate = (
+                    full_candidate[:ct_start] + new_ct + full_candidate[ct_end:]
+                )
+                ct_delta = len(new_ct) - (ct_end - ct_start)
+
+                all_ok = True
+                for ins_start, ins_end in inserts:
+                    adjusted_start = ins_start + ct_delta
+                    adjusted_end = ins_end + ct_delta
+                    if adjusted_start < 0 or adjusted_end > len(full_candidate):
+                        all_ok = False
+                        break
+                    ins_text = full_candidate[adjusted_start:adjusted_end]
+                    new_ins = self._drop_insert_columns(ins_text, columns, keep_indices)
+                    if new_ins is None or len(new_ins) >= len(ins_text):
+                        all_ok = False
+                        break
+                    full_candidate = (
+                        full_candidate[:adjusted_start]
+                        + new_ins
+                        + full_candidate[adjusted_end:]
+                    )
+                    ct_delta += len(new_ins) - len(ins_text)
+
+                if all_ok and len(full_candidate) < len(query):
+                    yield full_candidate
+
+    @staticmethod
+    def _parse_create_columns(cols_text: str) -> list[str]:
+        """Parse column definitions from CREATE TABLE column list.
+
+        Returns list of column names in order.  Handles multi-word types like
+        ``UNSIGNED BIG INT``.
+        """
+        columns: list[str] = []
+        # Split on commas but respect parenthesized expressions
+        depth = 0
+        current = ""
+        for ch in cols_text:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            if ch == ',' and depth == 0:
+                columns.append(current.strip())
+                current = ""
+            else:
+                current += ch
+        if current.strip():
+            columns.append(current.strip())
+
+        names: list[str] = []
+        for col_def in columns:
+            # First word is the column name
+            parts = col_def.split()
+            if parts:
+                names.append(parts[0])
+        return names
+
+    @staticmethod
+    def _rebuild_create_table(
+        ct_text: str, ct_match: re.Match, all_cols: list[str], keep_cols: list[str]
+    ) -> str | None:
+        """Rebuild CREATE TABLE keeping only the specified columns."""
+        tbl_name = ct_match.group(1)
+        cols_text = ct_match.group(2)
+
+        # Parse original column definitions preserving their full text
+        depth = 0
+        current = ""
+        col_defs: list[str] = []
+        for ch in cols_text:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            if ch == ',' and depth == 0:
+                col_defs.append(current.strip())
+                current = ""
+            else:
+                current += ch
+        if current.strip():
+            col_defs.append(current.strip())
+
+        keep_set = set(keep_cols)
+        # Find matching column defs by name
+        new_defs: list[str] = []
+        for col_def in col_defs:
+            name = col_def.split()[0] if col_def.split() else ""
+            if name in keep_set:
+                new_defs.append(col_def)
+                keep_set.discard(name)  # Only first occurrence
+
+        if not new_defs or len(new_defs) == len(col_defs):
+            return None
+
+        new_cols_text = ", ".join(new_defs)
+        return f"CREATE TABLE {tbl_name} ({new_cols_text});"
+
+    @staticmethod
+    def _drop_insert_columns(
+        ins_text: str, all_cols: list[str], keep_indices: set[int]
+    ) -> str | None:
+        """Remove values at non-kept column indices from an INSERT statement."""
+        values_match = re.search(
+            r'VALUES\s*\((.+)\)\s*;?\s*$', ins_text, re.IGNORECASE | re.DOTALL
+        )
+        if not values_match:
+            return None
+
+        values_text = values_match.group(1)
+        # Parse values respecting quoted strings and parentheses
+        vals = StringSimplifyPass._parse_insert_values(values_text)
+        if len(vals) != len(all_cols):
+            return None  # Column count mismatch, don't touch
+
+        keep_sorted = sorted(keep_indices)
+        new_vals = [vals[i] for i in keep_sorted if i < len(vals)]
+        if len(new_vals) == len(vals):
+            return None
+
+        prefix = ins_text[:values_match.start(1)]
+        suffix = ins_text[values_match.end(1):]
+        return f"{prefix}{', '.join(new_vals)}{suffix}"
+
+    @staticmethod
+    def _parse_insert_values(text: str) -> list[str]:
+        """Parse comma-separated VALUES respecting quotes and parens."""
+        values: list[str] = []
+        depth = 0
+        in_string = False
+        quote_char = ""
+        current = ""
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if in_string:
+                current += ch
+                if ch == quote_char:
+                    # Check for escaped quote
+                    if i + 1 < len(text) and text[i + 1] == quote_char:
+                        current += text[i + 1]
+                        i += 1
+                    else:
+                        in_string = False
+            elif ch in ("'", '"'):
+                in_string = True
+                quote_char = ch
+                current += ch
+            elif ch == '(':
+                depth += 1
+                current += ch
+            elif ch == ')':
+                depth -= 1
+                current += ch
+            elif ch == ',' and depth == 0:
+                values.append(current.strip())
+                current = ""
+            else:
+                current += ch
+            i += 1
+        if current.strip():
+            values.append(current.strip())
+        return values
 
     # ── JOIN simplification ─────────────────────────────────────────────
 
